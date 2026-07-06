@@ -1,0 +1,6 @@
+.env
+generate/generated/
+generate/timeseries/
+generate/timeseriesCompleted/
+generate/processed_files.txt
+generate/processed_generated.txt

@@ -1,1 +1,2 @@
-A general readme file about my thesis.
+# diplomamunka
+A general repository for my MSc thesis.
