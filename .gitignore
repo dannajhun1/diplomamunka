@@ -6,3 +6,7 @@ generate/processed_files.txt
 generate/processed_generated.txt
 processed_influx.txt
 diplomamunka.code-workspace
+continousLearning/household_power.txt
+continousLearning/sarima_model.pkl
+continousLearning/model_state.json
+continousLearning/jpg
