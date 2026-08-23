@@ -10,3 +10,9 @@ continousLearning/household_power.txt
 continousLearning/sarima_model.pkl
 continousLearning/model_state.json
 continousLearning/jpg
+continousLearning/history.jsonl
+continousLearning/model_params.pkl
+continousLearning/model_params.txt
+continousLearning/sarima_log.txt
+continousLearning/state.json
+continousLearning/forecast_plots

@@ -1,162 +1,574 @@
 import os
 import json
-import numpy as np
+from datetime import datetime
+
 import pandas as pd
 import matplotlib.pyplot as plt
-import pickle
+
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-from statsmodels.tsa.statespace.sarimax import SARIMAX, SARIMAXResults
 
-MODEL_FILE = "sarima_model.pkl"
-STATE_FILE = "model_state.json"
+# ============================================================
+# CONFIG
+# ============================================================
+
+RAW_FILE = "household_power.txt"
 
 TARGET = "Global_active_power"
 
-ORDER = (1, 1, 1)
-SEASONAL_ORDER = (1, 1, 0, 168)   # heti szezon (168 óra)
-TRAIN_WINDOW_DAYS = 45           # sliding window: utolsó 30 nap
+MODEL_ORDER = (1, 1, 1)
 
-print("Reading dataset...")
+INITIAL_TRAIN_DAYS = 7
+FORECAST_HOURS = 24
 
-df = pd.read_csv("household_power.txt", sep=";", na_values="?")
+STATE_FILE = "state.json"
+PARAMS_FILE = "model_params.pkl"
+MODEL_PARAMS_TEXT_FILE = "model_params.txt"
+LOG_FILE = "history.jsonl"
+RUN_LOG_FILE = "sarima_log.txt"
 
-df["datetime"] = pd.to_datetime(
-    df["Date"] + " " + df["Time"],
-    format="%d/%m/%Y %H:%M:%S"
-)
+PLOT_DIR = "forecast_plots"
 
-df = df.drop(columns=["Date", "Time"])
-df = df.set_index("datetime")
-df = df.sort_index()
 
-df = df.resample("h").mean().ffill()
-df.index.freq = "h"
+# ============================================================
+# LOG
+# ============================================================
 
-print("Dataset ready.")
+def log(message=""):
+    """
+    Kiírja az üzenetet a konzolra és a log fájlba is.
+    """
 
-# ---------------------------------------------------------
-# 1) INITIAL STATE – start AFTER the first full month + 30 days
-# ---------------------------------------------------------
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-if not os.path.exists(STATE_FILE):
+    line = f"[{timestamp}] {message}"
 
-    print("No state found, initializing...")
+    print(line)
 
-    # első hónap meghatározása
-    first_month = df.index.to_period("M")[0]
-    first_month_end = first_month.to_timestamp() + pd.offsets.MonthEnd(0)
+    with open(RUN_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
-    # sliding window induljon az első hónap UTÁN
-    start_day = first_month_end + pd.Timedelta(days=1)
 
-    # első forecast nap legyen 30 nappal később
-    next_day = start_day + pd.Timedelta(days=TRAIN_WINDOW_DAYS)
+def separator():
+    """
+    Elválasztó a logban.
+    """
 
-    # ha nincs elég adat → léptessük addig, amíg van
-    while next_day > df.index[-1].normalize():
-        start_day += pd.Timedelta(days=1)
-        next_day = start_day + pd.Timedelta(days=TRAIN_WINDOW_DAYS)
+    line = "=" * 70
+
+    print(line)
+
+    with open(RUN_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ============================================================
+# START LOG
+# ============================================================
+
+separator()
+
+log("SARIMA program indítása")
+log(f"Target: {TARGET}")
+log(f"Model order: {MODEL_ORDER}")
+log(f"Kezdeti tanítás: {INITIAL_TRAIN_DAYS} nap")
+log(f"Forecast: {FORECAST_HOURS} óra")
+
+separator()
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_data():
+
+    log("Adatok betöltése...")
+
+    df = pd.read_csv(
+        RAW_FILE,
+        sep=";",
+        na_values="?",
+        usecols=["Date", "Time", TARGET]
+    )
+
+    log(f"Beolvasott sorok: {len(df)}")
+
+    df["datetime"] = pd.to_datetime(
+        df["Date"] + " " + df["Time"],
+        format="%d/%m/%Y %H:%M:%S"
+    )
+
+    df = (
+        df[
+            ["datetime", TARGET]
+        ]
+        .set_index("datetime")
+        .sort_index()
+    )
+
+    log("Perces adatok átalakítása órás adatokra...")
+
+    df = df.resample("h").mean()
+
+    log("Hiányzó értékek kitöltése...")
+
+    df = df.ffill()
+
+    log(f"Órás adatok száma: {len(df)}")
+    log(f"Első adat: {df.index.min()}")
+    log(f"Utolsó adat: {df.index.max()}")
+
+    return df
+
+
+df = load_data()
+
+
+# ============================================================
+# EXOGENOUS VARIABLES
+# ============================================================
+
+def create_exog(index):
+
+    data = pd.DataFrame(index=index)
+
+    # Óra
+    for hour in range(1, 24):
+        data[f"hour_{hour}"] = (
+            index.hour == hour
+        ).astype(int)
+
+    # Hét napja
+    for day in range(1, 7):
+        data[f"dow_{day}"] = (
+            index.dayofweek == day
+        ).astype(int)
+
+    return data
+
+
+log("Exogén változók létrehozása: óra + hét napja")
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+if os.path.exists(STATE_FILE):
+
+    log("Meglévő state betöltése...")
+
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        state = json.load(f)
+
+    next_day = pd.Timestamp(
+        state["next_day"]
+    )
+
+    day_counter = state["day_counter"]
+
+    log(f"State betöltve.")
+    log(f"Következő forecast nap: {next_day.date()}")
+    log(f"Nap sorszáma: {day_counter}")
+
+else:
+
+    log("Nincs state fájl. Első futás.")
+
+    first_day = df.index.min().normalize()
+
+    next_day = (
+        first_day
+        + pd.Timedelta(days=INITIAL_TRAIN_DAYS)
+    )
+
+    day_counter = 0
 
     state = {
-        "next_day": str(next_day.normalize())
+        "next_day": str(next_day),
+        "day_counter": day_counter
     }
 
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
-    print("Initial state saved.")
-    exit()
+    log(f"State létrehozva.")
+    log(f"Első forecast nap: {next_day.date()}")
 
-# ---------------------------------------------------------
-# 2) LOAD STATE
-# ---------------------------------------------------------
 
-with open(STATE_FILE) as f:
-    state = json.load(f)
+separator()
 
-next_day = pd.to_datetime(state["next_day"]).normalize()
-print(f"Forecasting day: {next_day}")
+log(f"FORECAST NAP: {next_day.date()}")
+log(f"NAP SORSZÁMA: {day_counter}")
 
-# ---------------------------------------------------------
-# 2/A) LOAD MODEL PARAMS IF EXISTS
-# ---------------------------------------------------------
+separator()
 
-params = None
-if os.path.exists(MODEL_FILE):
-    with open(MODEL_FILE, "rb") as f:
-        params = pickle.load(f)
 
-# ---------------------------------------------------------
-# 3) BUILD TRAINING WINDOW
-# ---------------------------------------------------------
+# ============================================================
+# TRAINING DATA
+# ============================================================
 
-train_start = next_day - pd.Timedelta(days=TRAIN_WINDOW_DAYS)
+first_day = df.index.min().normalize()
+
+train_start = first_day
 train_end = next_day
 
-train = df[(df.index >= train_start) & (df.index < train_end)]
+train = df[
+    (df.index >= train_start)
+    &
+    (df.index < train_end)
+]
 
-print(f"Training window: {train_start} -> {train.index[-1]}")
+log("Tanítóadat létrehozása...")
 
-# ---------------------------------------------------------
-# 4) TRAIN SARIMA ON SLIDING WINDOW
-# ---------------------------------------------------------
+log(f"Tanítás kezdete: {train.index.min()}")
+log(f"Tanítás vége: {train.index.max()}")
+log(f"Tanító órák száma: {len(train)}")
+log(f"Tanító napok száma: {len(train) / 24:.1f}")
+
+
+# ============================================================
+# EXOGENOUS DATA
+# ============================================================
+
+train_exog = create_exog(
+    train.index
+)
+
+log(
+    f"Training exog shape: "
+    f"{train_exog.shape}"
+)
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+log("SARIMAX modell létrehozása...")
 
 model = SARIMAX(
     train[TARGET],
-    order=ORDER,
-    seasonal_order=SEASONAL_ORDER,
+    exog=train_exog,
+    order=MODEL_ORDER,
     enforce_invertibility=False
 )
 
-if params is None:
-    print("No model params found → full training.")
-    results = model.fit(disp=False)
+
+# ============================================================
+# CONTINUOUS LEARNING / WARM START
+# ============================================================
+
+if os.path.exists(PARAMS_FILE):
+
+    log("Előző modell paramétereinek betöltése...")
+
+    previous_params = pd.read_pickle(
+        PARAMS_FILE
+    )
+
+    log("Warm start használata.")
+
+    results = model.fit(
+        start_params=previous_params,
+        disp=False,
+        maxiter=50
+    )
+
 else:
-    print("Model params loaded → filtering.")
-    results = model.filter(params)
 
-# ---------------------------------------------------------
-# 5) FORECAST 1 DAY (24 hours)
-# ---------------------------------------------------------
+    log("Nincs korábbi modell.")
 
-forecast_steps = 24
-forecast = results.forecast(steps=forecast_steps)
+    log("Első modell tanítása...")
 
-print(forecast.head())
-print(forecast.describe())
-
-# ---------------------------------------------------------
-# 6) MEASURE ERROR ON NEXT DAY
-# ---------------------------------------------------------
-
-test = df[df.index.normalize() == next_day]
-test = test.iloc[:forecast_steps]
-
-mae = mean_absolute_error(test[TARGET], forecast)
-rmse = root_mean_squared_error(test[TARGET], forecast)
-
-print("------------------------------------")
-print(test[TARGET].describe())
-print(f"MAE  : {mae:.4f}")
-print(f"RMSE : {rmse:.4f}")
-print("------------------------------------")
-
-plt.figure(figsize=(15, 5))
-plt.plot(test.index, test[TARGET], label="Valós")
-plt.plot(test.index, forecast, label="SARIMA")
-plt.legend()
-plt.show()
-
-# ---------------------------------------------------------
-# 7) UPDATE STATE – move to next day
-# ---------------------------------------------------------
-
-state["next_day"] = str(next_day + pd.Timedelta(days=1))
+    results = model.fit(
+        disp=False,
+        maxiter=50
+    )
 
 
-params = results.params
-with open(MODEL_FILE, "wb") as f:
-    pickle.dump(params, f)
+log("Modell tanítása befejeződött.")
 
-print("State updated, ready for next day.")
+log(f"AIC: {results.aic:.4f}")
+
+
+# ============================================================
+# FORECAST
+# ============================================================
+
+log("Forecast készítése...")
+
+forecast_index = pd.date_range(
+    start=next_day,
+    periods=FORECAST_HOURS,
+    freq="h"
+)
+
+forecast_exog = create_exog(
+    forecast_index
+)
+
+forecast = results.forecast(
+    steps=FORECAST_HOURS,
+    exog=forecast_exog
+)
+
+log(
+    f"Forecast elkészült: "
+    f"{len(forecast)} óra"
+)
+
+log(
+    f"Forecast kezdete: "
+    f"{forecast_index.min()}"
+)
+
+log(
+    f"Forecast vége: "
+    f"{forecast_index.max()}"
+)
+
+
+# ============================================================
+# REAL DATA
+# ============================================================
+
+log("Valós adatok keresése...")
+
+test = df.loc[
+    (df.index >= next_day)
+    &
+    (
+        df.index
+        < next_day + pd.Timedelta(days=1)
+    ),
+    TARGET
+]
+
+log(
+    f"Valós adatok száma: "
+    f"{len(test)}"
+)
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+if len(test) == FORECAST_HOURS:
+
+    mae = mean_absolute_error(
+        test,
+        forecast
+    )
+
+    rmse = root_mean_squared_error(
+        test,
+        forecast
+    )
+
+    log("Kiértékelés:")
+
+    log(f"MAE :  {mae:.4f}")
+    log(f"RMSE:  {rmse:.4f}")
+    log(f"AIC :  {results.aic:.4f}")
+
+else:
+
+    mae = None
+    rmse = None
+
+    log(
+        "Nincs elegendő valós adat "
+        "a kiértékeléshez."
+    )
+
+    log(
+        f"Elérhető: "
+        f"{len(test)}/{FORECAST_HOURS} óra"
+    )
+
+
+# ============================================================
+# PLOT
+# ============================================================
+
+if len(test) == FORECAST_HOURS:
+
+    log("Forecast grafikon készítése...")
+
+    os.makedirs(
+        PLOT_DIR,
+        exist_ok=True
+    )
+
+    plt.figure(
+        figsize=(15, 5)
+    )
+
+    plt.plot(
+        test.index,
+        test,
+        label="Valós"
+    )
+
+    plt.plot(
+        forecast_index,
+        forecast,
+        label="Előrejelzés"
+    )
+
+    plt.title(
+        f"{next_day.date()} | "
+        f"MAE={mae:.4f} | "
+        f"RMSE={rmse:.4f}"
+    )
+
+    plt.xlabel("Idő")
+    plt.ylabel(TARGET)
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plot_file = os.path.join(
+        PLOT_DIR,
+        f"forecast_{next_day.date()}.png"
+    )
+
+    plt.savefig(
+        plot_file,
+        dpi=150
+    )
+
+    plt.close()
+
+    log(
+        f"Grafikon mentve: "
+        f"{plot_file}"
+    )
+
+
+# ============================================================
+# SAVE MODEL PARAMETERS
+# ============================================================
+
+log("Modell paramétereinek mentése...")
+
+# Gépi formátum
+results.params.to_pickle(PARAMS_FILE)
+
+# Emberileg olvasható formátum
+with open(
+    MODEL_PARAMS_TEXT_FILE,
+    "a",
+    encoding="utf-8"
+) as f:
+
+    f.write("=" * 70 + "\n")
+    f.write("SARIMA MODEL PARAMETERS\n")
+    f.write("=" * 70 + "\n")
+
+    f.write(f"Dátum: {next_day.date()}\n")
+    f.write(f"Nap: {day_counter}\n")
+    f.write(f"AIC: {results.aic:.6f}\n")
+    f.write(f"Model order: {MODEL_ORDER}\n")
+
+    f.write("\n")
+    f.write("Parameters:\n")
+    f.write("-" * 70 + "\n")
+
+    for name, value in results.params.items():
+
+        f.write(
+            f"{name:<30} : {value:.10f}\n"
+        )
+
+    f.write("=" * 70 + "\n")
+
+
+log(f"Paraméterek mentve: {PARAMS_FILE}")
+log(f"Olvasható paraméterek: {MODEL_PARAMS_TEXT_FILE}")
+
+
+# ============================================================
+# HISTORY LOG
+# ============================================================
+
+log("Eredmény naplózása...")
+
+history = {
+    "date": str(next_day.date()),
+    "day_counter": day_counter,
+    "train_hours": len(train),
+    "train_days": len(train) / 24,
+    "aic": float(results.aic),
+    "mae": mae,
+    "rmse": rmse
+}
+
+with open(
+    LOG_FILE,
+    "a",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        json.dumps(history) + "\n"
+    )
+
+log(
+    f"History mentve: "
+    f"{LOG_FILE}"
+)
+
+
+# ============================================================
+# UPDATE STATE
+# ============================================================
+
+log("State frissítése...")
+
+next_day = (
+    next_day
+    + pd.Timedelta(days=1)
+)
+
+state = {
+    "next_day": str(next_day),
+    "day_counter": day_counter + 1
+}
+
+with open(
+    STATE_FILE,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        state,
+        f
+    )
+
+log(
+    f"Következő forecast: "
+    f"{next_day.date()}"
+)
+
+log(
+    f"Következő nap sorszáma: "
+    f"{day_counter + 1}"
+)
+
+
+# ============================================================
+# END
+# ============================================================
+
+separator()
+
+log("FUTÁS BEFEJEZŐDÖTT")
+
+separator()
