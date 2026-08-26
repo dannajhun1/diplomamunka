@@ -16,3 +16,8 @@ continousLearning/model_params.txt
 continousLearning/sarima_log.txt
 continousLearning/state.json
 continousLearning/forecast_plots
+continousLearning/converter.py
+continousLearning/household_power.csv
+continousLearning/text_to_influx.py
+continousLearning/influx_line_convert.py
+continousLearning/household_power_consumption.lp
