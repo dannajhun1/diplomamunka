@@ -8,12 +8,20 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
+from influxdb_client import InfluxDBClient  # pip install influxdb-client
+from dotenv import load_dotenv  # pip install python-dotenv
+
+
+# ============================================================
+# .ENV BETÖLTÉSE
+# ============================================================
+
+load_dotenv()  # alapból a .env fájlt keresi a jelenlegi munkakönyvtárban
+
 
 # ============================================================
 # CONFIG
 # ============================================================
-
-RAW_FILE = "household_power.txt"
 
 TARGET = "Global_active_power"
 
@@ -29,6 +37,30 @@ LOG_FILE = "history.jsonl"
 RUN_LOG_FILE = "sarima_log.txt"
 
 PLOT_DIR = "forecast_plots"
+
+# --- InfluxDB kapcsolat (.env fájlból) ---
+INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
+INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
+INFLUX_ORG = os.getenv("INFLUX_ORG")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
+INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT")
+
+for var_name, var_value in [
+    ("INFLUX_TOKEN", INFLUX_TOKEN),
+    ("INFLUX_ORG", INFLUX_ORG),
+    ("INFLUX_BUCKET", INFLUX_BUCKET),
+    ("INFLUX_MEASUREMENT", INFLUX_MEASUREMENT),
+]:
+    if not var_value:
+        raise RuntimeError(
+            f"Hiányzó környezeti változó: {var_name} "
+            f"(ellenőrizd a .env fájlt)"
+        )
+
+# Az adatsor legkorábbi időpontja (csak egyszer kell beállítani).
+# Erre azért van szükség, mert nem kérdezzük le az egész adatbázist
+# csak azért, hogy megtudjuk, mikor kezdődik az adatsor.
+DATA_START = "2006-12-16 17:24:00"
 
 
 # ============================================================
@@ -79,51 +111,68 @@ separator()
 
 
 # ============================================================
-# LOAD DATA
+# LOAD DATA (InfluxDB-ből, csak a megadott időintervallumra)
 # ============================================================
 
-def load_data():
+def load_data(start, end):
+    """
+    Lekérdezi az adatokat InfluxDB-ből a [start, end) intervallumra,
+    óránkénti átlaggal (aggregateWindow), NEM az összes adatot.
+    """
 
-    log("Adatok betöltése...")
+    log(f"Adatok lekérdezése InfluxDB-ből: {start} -> {end}")
 
-    df = pd.read_csv(
-        RAW_FILE,
-        sep=";",
-        na_values="?",
-        usecols=["Date", "Time", TARGET]
-    )
+    start_str = pd.Timestamp(start).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = pd.Timestamp(end).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    log(f"Beolvasott sorok: {len(df)}")
+    flux = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: {start_str}, stop: {end_str})
+      |> filter(fn: (r) => r._measurement == "{INFLUX_MEASUREMENT}")
+      |> filter(fn: (r) => r._field == "{TARGET}")
+      |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+      |> keep(columns: ["_time", "_value"])
+      |> sort(columns: ["_time"])
+    '''
 
-    df["datetime"] = pd.to_datetime(
-        df["Date"] + " " + df["Time"],
-        format="%d/%m/%Y %H:%M:%S"
-    )
+    client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 
-    df = (
-        df[
-            ["datetime", TARGET]
-        ]
-        .set_index("datetime")
-        .sort_index()
-    )
+    try:
+        tables = client.query_api().query(flux)
+    finally:
+        client.close()
 
-    log("Perces adatok átalakítása órás adatokra...")
+    rows = [
+        {"datetime": record.get_time(), TARGET: record.get_value()}
+        for table in tables
+        for record in table.records
+    ]
 
-    df = df.resample("h").mean()
+    df = pd.DataFrame(rows)
 
-    log("Hiányzó értékek kitöltése...")
+    log(f"Beolvasott (óránkénti) sorok: {len(df)}")
+
+    if df.empty:
+        log("Nincs adat a megadott intervallumra!")
+        return df.set_index(pd.DatetimeIndex([], name="datetime"))
+
+    df = df.set_index("datetime").sort_index()
+
+    # Influx UTC időbélyeget ad vissza, a naiv (tz nélküli) formára hozzuk,
+    # hogy a többi rész (create_exog, összehasonlítások) változatlan maradhasson.
+    df.index = df.index.tz_localize(None)
+
+    log("Hiányzó órák kitöltése (ffill)...")
 
     df = df.ffill()
 
     log(f"Órás adatok száma: {len(df)}")
-    log(f"Első adat: {df.index.min()}")
-    log(f"Utolsó adat: {df.index.max()}")
+
+    if len(df) > 0:
+        log(f"Első adat: {df.index.min()}")
+        log(f"Utolsó adat: {df.index.max()}")
 
     return df
-
-
-df = load_data()
 
 
 # ============================================================
@@ -156,6 +205,8 @@ log("Exogén változók létrehozása: óra + hét napja")
 # STATE
 # ============================================================
 
+first_day = pd.Timestamp(DATA_START).normalize()
+
 if os.path.exists(STATE_FILE):
 
     log("Meglévő state betöltése...")
@@ -176,8 +227,6 @@ if os.path.exists(STATE_FILE):
 else:
 
     log("Nincs state fájl. Első futás.")
-
-    first_day = df.index.min().normalize()
 
     next_day = (
         first_day
@@ -207,13 +256,21 @@ separator()
 
 
 # ============================================================
-# TRAINING DATA
+# ADATOK LEKÉRDEZÉSE (csak a tanításhoz + aznapi kiértékeléshez kellő rész)
 # ============================================================
-
-first_day = df.index.min().normalize()
 
 train_start = first_day
 train_end = next_day
+
+query_start = train_start
+query_end = next_day + pd.Timedelta(days=1)  # +1 nap, hogy a teszt (valós) adat is benne legyen
+
+df = load_data(query_start, query_end)
+
+
+# ============================================================
+# TRAINING DATA
+# ============================================================
 
 train = df[
     (df.index >= train_start)
