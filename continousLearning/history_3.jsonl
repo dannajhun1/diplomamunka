@@ -1,0 +1,1 @@
+{"date": "2006-12-30", "day_counter": 7, "train_hours": 318, "train_days": 13.25, "aic": 716.6853208161799, "mae": 1.257404519596069, "rmse": 1.4597101446335654, "retrained": true, "retrain_cost_threshold": 0.2, "influx_query_seconds": 0.06749859999399632, "influx_rows_fetched": 343, "model_update_seconds": 0.5272923000156879}

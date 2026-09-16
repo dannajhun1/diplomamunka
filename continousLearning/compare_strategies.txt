@@ -1,0 +1,7 @@
+PS C:\Users\danie\Desktop\ELTE\diplomamunka\project\diplomamunka\continousLearning> python .\compare_strategies.py .\history_2.jsonl .\history_3.jsonl
+               stratégia  napok száma  újratanítások száma  újratanítás aránya (%)  átlagos MAE  összesített MAE  InfluxDB idő össz. (s)  InfluxDB sorok össz.  Modell-frissítés idő össz. (s)
+Eredeti (mindig retrain)            1                    1                   100.0       0.9633           0.9633                     NaN                   NaN                             NaN
+     Markov (cost-aware)            1                    1                   100.0       1.2574           1.2574                    0.07                 343.0                            0.53
+
+Spórolt újratanítások: 0.0%
+MAE változás a baseline-hoz képest: +30.5%
