@@ -1,0 +1,14 @@
+{
+  "T": 10,
+  "horizon_days": 6,
+  "min_train_days": 14,
+  "order": [
+    1,
+    1,
+    1
+  ],
+  "total_fit_seconds": 5.818153200089,
+  "total_append_seconds": 0.2667754004942253,
+  "total_forecast_calls": 49,
+  "num_fits": 10
+}

@@ -1,2 +1,13 @@
 # diplomamunka
 A general repository for my MSc thesis.
+
+
+python estimate_runtime.py --start 2006-12-19 --end 2010-11-30 --max-train-days 90 --t-prime-step-days 7
+
+# Demo (szintetikus adat, nem kell InfluxDB/.env):
+python build_cost_matrix.py --demo
+python estimate_runtime.py --demo
+
+# Valós adat InfluxDB-ből:
+python estimate_runtime.py --start 2006-12-19 --end 2010-11-30 --max-train-days 90 --t-prime-step-days 7
+python build_cost_matrix.py --start 2006-12-19 --end 2010-11-30 --max-train-days 90 --t-prime-step-days 7 --horizon-days 30

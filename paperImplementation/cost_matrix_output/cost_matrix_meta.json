@@ -1,0 +1,16 @@
+{
+  "T": 1425,
+  "horizon_days": 30,
+  "min_train_days": 14,
+  "max_train_days": 90,
+  "t_prime_step_days": 7,
+  "order": [
+    1,
+    1,
+    1
+  ],
+  "total_fit_seconds": 949.5968237018678,
+  "total_append_seconds": 77.74054129747674,
+  "total_forecast_calls": 6254,
+  "num_fits": 204
+}
